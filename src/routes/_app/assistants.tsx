@@ -125,7 +125,7 @@ function AssistantsPage() {
 
       {/* Table */}
       <div className="flex-1 overflow-y-auto scrollbar-thin px-6 pb-6">
-        <div className="overflow-hidden rounded-xl border border-border">
+        <div className="relative overflow-visible rounded-xl border border-border">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border bg-bg-subtle">

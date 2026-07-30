@@ -31,7 +31,7 @@ export function Dropdown({
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full"
+        className="w-full relative z-10"
       >
         {trigger}
       </button>
