@@ -7,30 +7,68 @@ import {
   Trash2,
   Sparkles,
   User as UserIcon,
+  Square,
+  FileText,
+  AlertTriangle,
 } from "lucide-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { supabase } from "../../lib/supabase";
-import { useAssistants, setActiveAssistant } from "../../lib/queries";
+import { useQueryClient } from "@tanstack/react-query";
+import { ApiError, streamChat } from "../../lib/api";
+import {
+  queryKeys,
+  useAssistants,
+  useConversations,
+  useMessages,
+  useRefreshAfterChat,
+  deleteConversation,
+  setActiveAssistant,
+} from "../../lib/queries";
 import { AssistantSwitcher } from "../../components/AssistantSwitcher";
 import { Button } from "../../components/Button";
 import { cn, formatRelativeTime } from "../../lib/utils";
-import type { Conversation, Message } from "../../types";
+import type { Citation, TokenUsage } from "../../types";
 
 export const Route = createFileRoute("/_app/chat")({
   component: ChatPage,
 });
 
+/** What the last completed turn was grounded on, shown under the answer. */
+type TurnMeta = {
+  citations: Citation[];
+  usage: TokenUsage | null;
+  model: string | null;
+};
+
 function ChatPage() {
   const queryClient = useQueryClient();
+  const refreshAfterChat = useRefreshAfterChat();
   const { data: assistants } = useAssistants();
 
   const [activeAssistantId, setActiveAssistantId] = useState<string | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Initialize active assistant
+  // Streaming state. `pendingQuestion` renders the user's bubble optimistically,
+  // because the backend only persists both messages once generation finishes.
+  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
+  const [streamedAnswer, setStreamedAnswer] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastTurn, setLastTurn] = useState<TurnMeta | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const { data: conversations } = useConversations(activeAssistantId);
+  const { data: messages } = useMessages(activeConversationId);
+
+  const activeAssistant = assistants?.find((a) => a.id === activeAssistantId);
+
+  /* --------------------------------------------------------------------- */
+  /* Effects                                                                */
+  /* --------------------------------------------------------------------- */
+
+  // Pick an assistant on first load: the active one, else the first.
   useEffect(() => {
     if (assistants && assistants.length > 0 && !activeAssistantId) {
       const active = assistants.find((a) => a.is_active) ?? assistants[0]!;
@@ -38,137 +76,158 @@ function ChatPage() {
     }
   }, [assistants, activeAssistantId]);
 
-  const { data: conversations } = useQuery({
-    queryKey: ["conversations", activeAssistantId],
-    queryFn: async () => {
-      if (!activeAssistantId) return [];
-      const { data, error } = await supabase
-        .from("conversations")
-        .select("*")
-        .eq("assistant_id", activeAssistantId)
-        .order("updated_at", { ascending: false });
-      if (error) throw error;
-      return data as Conversation[];
-    },
-    enabled: !!activeAssistantId,
-  });
-
-  const { data: messages } = useQuery({
-    queryKey: ["messages", activeConversationId],
-    queryFn: async () => {
-      if (!activeConversationId) return [];
-      const { data, error } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("conversation_id", activeConversationId)
-        .order("created_at", { ascending: true });
-      if (error) throw error;
-      return data as Message[];
-    },
-    enabled: !!activeConversationId,
-  });
-
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, streamedAnswer, pendingQuestion]);
+
+  // Cancel an in-flight stream if the page unmounts.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  /* --------------------------------------------------------------------- */
+  /* Handlers                                                               */
+  /* --------------------------------------------------------------------- */
 
   async function handleSelectAssistant(id: string) {
     setActiveAssistantId(id);
     setActiveConversationId(null);
+    resetTurnState();
     await setActiveAssistant(id);
-    await queryClient.invalidateQueries({ queryKey: ["assistants"] });
+    await queryClient.invalidateQueries({ queryKey: queryKeys.assistants });
   }
 
-  async function handleNewChat() {
-    if (!activeAssistantId) return;
-    const title = `Chat ${new Date().toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    })}`;
-    const { data, error } = await supabase
-      .from("conversations")
-      .insert({ assistant_id: activeAssistantId, title })
-      .select()
-      .single();
-    if (error) {
-      console.error(error);
-      return;
-    }
-    await queryClient.invalidateQueries({ queryKey: ["conversations", activeAssistantId] });
-    setActiveConversationId((data as Conversation).id);
+  /**
+   * "New chat" only clears local state. The conversation row is created by the
+   * backend on the first message, so an abandoned draft never leaves an empty
+   * conversation in the sidebar.
+   */
+  function handleNewChat() {
+    setActiveConversationId(null);
+    resetTurnState();
+    textareaRef.current?.focus();
+  }
+
+  function handleSelectConversation(id: string) {
+    setActiveConversationId(id);
+    resetTurnState();
+  }
+
+  function resetTurnState() {
+    setPendingQuestion(null);
+    setStreamedAnswer("");
+    setError(null);
+    setLastTurn(null);
   }
 
   async function handleDeleteConversation(id: string) {
-    const { error } = await supabase.from("conversations").delete().eq("id", id);
-    if (error) {
-      console.error(error);
-      return;
+    try {
+      await deleteConversation(id);
+      if (activeConversationId === id) {
+        setActiveConversationId(null);
+        resetTurnState();
+      }
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.conversations(activeAssistantId),
+      });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not delete conversation.");
     }
-    if (activeConversationId === id) setActiveConversationId(null);
-    await queryClient.invalidateQueries({ queryKey: ["conversations", activeAssistantId] });
+  }
+
+  function handleStop() {
+    // Aborts reading only. The backend finishes the run on purpose so the answer
+    // is still saved; the refetch below picks up the complete version.
+    abortRef.current?.abort();
   }
 
   async function handleSend() {
-    const content = input.trim();
-    if (!content || !activeAssistantId || sending) return;
+    const question = input.trim();
+    if (!question || !activeAssistantId || sending) return;
 
-    let conversationId = activeConversationId;
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-    // Create conversation if none selected
-    if (!conversationId) {
-      const { data: conv, error: convErr } = await supabase
-        .from("conversations")
-        .insert({
-          assistant_id: activeAssistantId,
-          title: content.slice(0, 40),
-        })
-        .select()
-        .single();
-      if (convErr) {
-        console.error(convErr);
-        return;
-      }
-      conversationId = (conv as Conversation).id;
-      setActiveConversationId(conversationId);
-      await queryClient.invalidateQueries({ queryKey: ["conversations", activeAssistantId] });
-    }
-
-    setSending(true);
     setInput("");
+    setError(null);
+    setLastTurn(null);
+    setPendingQuestion(question);
+    setStreamedAnswer("");
+    setSending(true);
 
-    // Insert user message
-    const { error: msgErr } = await supabase.from("messages").insert({
-      conversation_id: conversationId,
-      role: "user",
-      content,
-    });
-    if (msgErr) {
-      console.error(msgErr);
+    // Tracked separately from state: a new conversation's id arrives in the
+    // `start` event, and the cleanup path needs it even after an abort.
+    let conversationId = activeConversationId;
+    let answer = "";
+
+    try {
+      const stream = streamChat(
+        {
+          question,
+          assistant_id: activeAssistantId,
+          conversation_id: activeConversationId,
+        },
+        controller.signal,
+      );
+
+      for await (const event of stream) {
+        switch (event.type) {
+          case "start":
+            conversationId = event.conversation_id;
+            if (event.is_new_conversation) {
+              setActiveConversationId(event.conversation_id);
+              // Show the new thread in the sidebar right away.
+              await queryClient.invalidateQueries({
+                queryKey: queryKeys.conversations(activeAssistantId),
+              });
+            }
+            break;
+
+          case "token":
+            answer += event.content;
+            setStreamedAnswer(answer);
+            break;
+
+          case "revision":
+            // A guardrail rewrote the answer — replace what we rendered.
+            answer = event.content;
+            setStreamedAnswer(answer);
+            break;
+
+          case "done":
+            conversationId = event.conversation_id;
+            setLastTurn({
+              citations: event.citations,
+              usage: event.usage,
+              model: event.model,
+            });
+            if (event.warning) setError(event.warning);
+            break;
+
+          case "error":
+            setError(event.message);
+            break;
+        }
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "aborted") {
+        // Expected: the user pressed Stop.
+      } else if (err instanceof ApiError) {
+        setError(err.message);
+      } else {
+        setError("Something went wrong while streaming the response.");
+      }
+    } finally {
+      abortRef.current = null;
       setSending(false);
-      return;
+
+      // Swap the optimistic bubbles for the persisted messages.
+      if (conversationId) {
+        await refreshAfterChat(conversationId, activeAssistantId);
+      }
+      setPendingQuestion(null);
+      setStreamedAnswer("");
     }
-
-    await queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
-
-    // Simulate assistant response (RAG backend would be wired here)
-    await new Promise((r) => setTimeout(r, 800));
-    const assistantName =
-      assistants?.find((a) => a.id === activeAssistantId)?.name ?? "Assistant";
-    const response = `This is a simulated response from ${assistantName}. In a production RAG system, this would query your knowledge base using the uploaded documents and the assistant's system prompt to generate a grounded answer.\n\nYour message was: "${content}"`;
-
-    const { error: respErr } = await supabase.from("messages").insert({
-      conversation_id: conversationId,
-      role: "assistant",
-      content: response,
-    });
-    if (respErr) console.error(respErr);
-
-    await queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
-    setSending(false);
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -178,7 +237,12 @@ function ChatPage() {
     }
   }
 
-  const activeAssistant = assistants?.find((a) => a.id === activeAssistantId);
+  const showEmptyState =
+    !pendingQuestion && (!activeConversationId || messages?.length === 0);
+
+  /* --------------------------------------------------------------------- */
+  /* Render                                                                 */
+  /* --------------------------------------------------------------------- */
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -200,7 +264,7 @@ function ChatPage() {
             <button
               key={conv.id}
               type="button"
-              onClick={() => setActiveConversationId(conv.id)}
+              onClick={() => handleSelectConversation(conv.id)}
               className={cn(
                 "group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors",
                 conv.id === activeConversationId
@@ -240,10 +304,14 @@ function ChatPage() {
 
       {/* Chat area */}
       <div className="flex flex-1 flex-col overflow-hidden">
-        {/* Header with assistant switcher */}
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-border bg-bg-subtle px-5">
           <div className="flex items-center gap-3">
             <h1 className="text-base font-semibold text-text-bright">Chat</h1>
+            {activeAssistant && (
+              <span className="rounded-md border border-border bg-bg-elevate px-2 py-0.5 font-mono text-[11px] text-text-faint">
+                {activeAssistant.model}
+              </span>
+            )}
           </div>
           <AssistantSwitcher
             activeId={activeAssistantId}
@@ -253,7 +321,7 @@ function ChatPage() {
 
         {/* Messages */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
-          {!activeConversationId || messages?.length === 0 ? (
+          {showEmptyState ? (
             <div className="flex h-full flex-col items-center justify-center px-6 text-center">
               <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-primary-subtle">
                 <Sparkles className="h-7 w-7 text-primary" />
@@ -263,58 +331,39 @@ function ChatPage() {
               </h2>
               <p className="mt-1.5 max-w-sm text-sm text-text-faint">
                 {activeAssistant
-                  ? "Start a conversation by typing a message below."
+                  ? "Ask a question. Answers are grounded in this assistant's knowledge base."
                   : "Choose an assistant from the dropdown to begin chatting."}
               </p>
             </div>
           ) : (
             <div className="mx-auto max-w-3xl px-6 py-8 space-y-6">
               {messages?.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={cn(
-                    "flex gap-4 animate-fade-in",
-                    msg.role === "user" ? "flex-row-reverse" : "flex-row",
-                  )}
-                >
-                  <div
-                    className={cn(
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
-                      msg.role === "user"
-                        ? "bg-bg-elevate"
-                        : "bg-primary-subtle",
-                    )}
-                  >
-                    {msg.role === "user" ? (
-                      <UserIcon className="h-4 w-4 text-text-muted" />
-                    ) : (
-                      <Sparkles className="h-4 w-4 text-primary" />
-                    )}
-                  </div>
-                  <div
-                    className={cn(
-                      "max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed",
-                      msg.role === "user"
-                        ? "bg-primary text-white rounded-tr-sm"
-                        : "bg-bg-elevate text-text-bright rounded-tl-sm border border-border",
-                    )}
-                  >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
-                  </div>
-                </div>
+                <MessageBubble key={msg.id} role={msg.role} content={msg.content} />
               ))}
-              {sending && (
-                <div className="flex gap-4 animate-fade-in">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary-subtle">
-                    <Sparkles className="h-4 w-4 text-primary" />
-                  </div>
-                  <div className="rounded-2xl rounded-tl-sm border border-border bg-bg-elevate px-4 py-3">
-                    <div className="flex gap-1.5">
-                      <span className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot" style={{ animationDelay: "0ms" }} />
-                      <span className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot" style={{ animationDelay: "200ms" }} />
-                      <span className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot" style={{ animationDelay: "400ms" }} />
-                    </div>
-                  </div>
+
+              {/* Optimistic user bubble while the turn is in flight */}
+              {pendingQuestion && (
+                <MessageBubble role="user" content={pendingQuestion} />
+              )}
+
+              {/* Streaming assistant bubble */}
+              {pendingQuestion && (
+                <MessageBubble
+                  role="assistant"
+                  content={streamedAnswer}
+                  streaming={sending && !streamedAnswer}
+                />
+              )}
+
+              {/* Grounding sources for the completed turn */}
+              {lastTurn && lastTurn.citations.length > 0 && (
+                <Citations meta={lastTurn} />
+              )}
+
+              {error && (
+                <div className="flex items-start gap-2 rounded-xl border border-error-border bg-error-subtle px-4 py-3 text-sm text-error animate-slide-down">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{error}</span>
                 </div>
               )}
             </div>
@@ -326,6 +375,7 @@ function ChatPage() {
           <div className="mx-auto max-w-3xl">
             <div className="relative flex items-end gap-2 rounded-2xl border border-border bg-bg-input px-4 py-3 transition-colors focus-within:border-primary">
               <textarea
+                ref={textareaRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
@@ -334,19 +384,30 @@ function ChatPage() {
                     ? `Message ${activeAssistant?.name ?? "assistant"}…`
                     : "Select an assistant first…"
                 }
-                disabled={!activeAssistantId}
+                disabled={!activeAssistantId || sending}
                 rows={1}
                 className="flex-1 resize-none bg-transparent text-sm text-text-bright placeholder:text-text-faint focus:outline-none disabled:opacity-50 max-h-32"
                 style={{ minHeight: "24px" }}
               />
-              <button
-                type="button"
-                onClick={handleSend}
-                disabled={!input.trim() || sending || !activeAssistantId}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-white transition-colors hover:bg-primary-hover disabled:opacity-40 disabled:pointer-events-none"
-              >
-                <Send className="h-4 w-4" />
-              </button>
+              {sending ? (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  title="Stop streaming"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-bg-elevate border border-border text-text-muted transition-colors hover:text-text-bright"
+                >
+                  <Square className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleSend}
+                  disabled={!input.trim() || !activeAssistantId}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-white transition-colors hover:bg-primary-hover disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  <Send className="h-4 w-4" />
+                </button>
+              )}
             </div>
             <p className="mt-2 text-center text-xs text-text-faint">
               Press Enter to send, Shift+Enter for new line
@@ -354,6 +415,121 @@ function ChatPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sub-components                                                             */
+/* ------------------------------------------------------------------------- */
+
+function MessageBubble({
+  role,
+  content,
+  streaming = false,
+}: {
+  role: "user" | "assistant" | "system";
+  content: string;
+  streaming?: boolean;
+}) {
+  const isUser = role === "user";
+
+  return (
+    <div
+      className={cn(
+        "flex gap-4 animate-fade-in",
+        isUser ? "flex-row-reverse" : "flex-row",
+      )}
+    >
+      <div
+        className={cn(
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+          isUser ? "bg-bg-elevate" : "bg-primary-subtle",
+        )}
+      >
+        {isUser ? (
+          <UserIcon className="h-4 w-4 text-text-muted" />
+        ) : (
+          <Sparkles className="h-4 w-4 text-primary" />
+        )}
+      </div>
+      <div
+        className={cn(
+          "max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed",
+          isUser
+            ? "bg-primary text-white rounded-tr-sm"
+            : "bg-bg-elevate text-text-bright rounded-tl-sm border border-border",
+        )}
+      >
+        {streaming ? (
+          <div className="flex gap-1.5 py-0.5">
+            <span
+              className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot"
+              style={{ animationDelay: "0ms" }}
+            />
+            <span
+              className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot"
+              style={{ animationDelay: "200ms" }}
+            />
+            <span
+              className="h-2 w-2 rounded-full bg-text-faint animate-bounce-dot"
+              style={{ animationDelay: "400ms" }}
+            />
+          </div>
+        ) : (
+          <p className="whitespace-pre-wrap">{content}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Which chunks grounded the answer, plus token usage. */
+function Citations({ meta }: { meta: TurnMeta }) {
+  // One entry per file, keeping its best-scoring chunk.
+  const byFile = new Map<string, Citation>();
+  for (const citation of meta.citations) {
+    const key = citation.file_id ?? citation.filename ?? citation.id;
+    const existing = byFile.get(key);
+    if (!existing || (citation.score ?? 0) > (existing.score ?? 0)) {
+      byFile.set(key, citation);
+    }
+  }
+
+  return (
+    <div className="ml-12 space-y-2 animate-fade-in">
+      <div className="flex items-center gap-2 text-xs font-medium text-text-faint">
+        <FileText className="h-3.5 w-3.5" />
+        Sources
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {[...byFile.values()].map((citation) => (
+          <span
+            key={citation.id}
+            title={
+              citation.score !== null
+                ? `Relevance ${citation.score.toFixed(3)}`
+                : undefined
+            }
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg-elevate px-2.5 py-1 text-xs text-text-muted"
+          >
+            <span className="truncate max-w-[220px]">
+              {citation.filename ?? "Unknown source"}
+            </span>
+            {citation.score !== null && (
+              <span className="font-mono text-[10px] text-text-faint">
+                {citation.score.toFixed(2)}
+              </span>
+            )}
+          </span>
+        ))}
+      </div>
+      {meta.usage && meta.usage.total_tokens > 0 && (
+        <p className="text-[11px] text-text-faint">
+          {meta.model} · {meta.usage.prompt_tokens} in / {meta.usage.completion_tokens} out ·{" "}
+          {meta.usage.total_tokens} tokens
+        </p>
+      )}
     </div>
   );
 }
